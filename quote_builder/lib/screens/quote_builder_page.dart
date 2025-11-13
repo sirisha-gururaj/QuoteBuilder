@@ -1,9 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
+import 'package:flutter/services.dart';
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:quote_builder/models/line_item.dart';
 import 'package:quote_builder/widgets/form_helpers.dart';
+import 'package:quote_builder/screens/save_draft_button.dart';
+import 'package:quote_builder/screens/load_draft_button.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:pdf/pdf.dart' as pdf;
 import 'package:printing/printing.dart';
@@ -89,6 +92,12 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
   // LayerLinks for composited transforms so overlays follow scrolling
   final LayerLink _currencyLink = LayerLink();
   final LayerLink _taxLink = LayerLink();
+  // Keep references to overlay entries so we can toggle (close on second tap)
+  OverlayEntry? _taxOverlayEntry;
+  OverlayEntry? _currencyOverlayEntry;
+  // If the user loads a draft for editing, store its id so that when they
+  // send the quote we can remove that draft from saved drafts.
+  String? _loadedDraftId;
 
   @override
   void initState() {
@@ -121,6 +130,14 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
               key: _taxFieldKey,
               onTap: () async {
                 if (!_isEditable) return;
+                // If the overlay is already shown, remove it (second tap closes)
+                if (_taxOverlayEntry != null) {
+                  try {
+                    _taxOverlayEntry!.remove();
+                  } catch (_) {}
+                  _taxOverlayEntry = null;
+                  return;
+                }
                 final RenderBox? rb =
                     _taxFieldKey.currentContext?.findRenderObject()
                         as RenderBox?;
@@ -193,6 +210,7 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
                                         title: const Text('Tax Exclusive'),
                                         onTap: () {
                                           overlayEntry.remove();
+                                          _taxOverlayEntry = null;
                                           if (_taxMode != 'exclusive') {
                                             setState(
                                               () => _taxMode = 'exclusive',
@@ -205,6 +223,7 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
                                         title: const Text('Tax Inclusive'),
                                         onTap: () {
                                           overlayEntry.remove();
+                                          _taxOverlayEntry = null;
                                           if (_taxMode != 'inclusive') {
                                             setState(
                                               () => _taxMode = 'inclusive',
@@ -226,6 +245,7 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
                 );
 
                 Overlay.of(context, rootOverlay: true).insert(overlayEntry);
+                _taxOverlayEntry = overlayEntry;
               },
               child: InputDecorator(
                 decoration: InputDecoration(
@@ -335,6 +355,38 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
     });
   }
 
+  /// Compute a single line's total from its current fields, using the
+  /// same rules as `_calculateQuote`. This is used for display so the UI
+  /// shows an up-to-date value even if the stored `item.total` hasn't
+  /// been refreshed for any reason (keeps logic identical to calculation).
+  double _computeLineTotal(LineItem item) {
+    final basePrice = (item.rate - item.discount) * item.quantity;
+    if (_taxMode == 'exclusive') {
+      final lineTax = basePrice * (item.taxPercent / 100);
+      return basePrice + lineTax;
+    } else {
+      // Tax included in price: total is the basePrice, which already
+      // includes tax according to the existing logic.
+      return basePrice;
+    }
+  }
+
+  /// Clear the form to an initial empty state so the user can enter a
+  /// fresh quote after saving a draft.
+  void _clearForm() {
+    setState(() {
+      _clientNameController.text = '';
+      _clientAddressController.text = '';
+      _clientRefController.text = '';
+      _quoteStatus = QuoteStatus.draft;
+      _taxMode = 'exclusive';
+      _selectedCurrencySymbol = '₹';
+      _lineItems = [LineItem(id: UniqueKey().toString())];
+    });
+    _updateCurrencyFormatter();
+    _calculateQuote();
+  }
+
   // --- MOCK ACTIONS ---
 
   void _showMockSnackBar(String message, IconData icon) {
@@ -368,16 +420,34 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
       return;
     }
     // If the current filled data is incomplete (partial line items or missing
-    // required bits), inform the user and don't save.
+    // required bits), prompt the user whether they want to continue editing
+    // or save anyway. This mirrors the existing prompt used for the
+    // "only client data" case but applies it to incomplete item data as
+    // requested.
     if (_isDraftIncomplete()) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Draft is incomplete. Please fill required fields before saving.',
+      final result = await showDialog<bool>(
+        context: context,
+        useRootNavigator: true,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Incomplete draft'),
+          content: const Text(
+            'Some line items or required fields appear incomplete. Do you want to save the draft now or continue filling the remaining details?',
           ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('Continue editing'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('Save anyway'),
+            ),
+          ],
         ),
       );
-      return;
+
+      // If the user chose not to save, just return.
+      if (result != true) return;
     }
 
     // If the user has only filled client details and nothing else, ask them
@@ -386,6 +456,7 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
     if (_isOnlyClientData()) {
       final result = await showDialog<bool>(
         context: context,
+        useRootNavigator: true,
         builder: (ctx) => AlertDialog(
           title: const Text('Incomplete draft'),
           content: const Text(
@@ -433,18 +504,49 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
     // save multiple drafts. Keep the legacy 'quote_draft' key updated for
     // compatibility with older flows.
     try {
+      // Ensure item totals are up-to-date before persisting so the saved
+      // draft contains accurate prices.
+      for (var item in _lineItems) {
+        item.total = _computeLineTotal(item);
+      }
+
       final rawList = prefs.getString('quote_drafts');
       List<dynamic> list = rawList != null ? jsonDecode(rawList) as List : [];
 
       final entry = Map<String, dynamic>.from(data);
-      entry['id'] = DateTime.now().toIso8601String();
-      entry['createdAt'] = DateTime.now().toIso8601String();
+      // If we loaded a draft for editing, update that same draft instead of
+      // creating a new one. Preserve the original createdAt when replacing.
+      final String idToUse = _loadedDraftId ?? DateTime.now().toIso8601String();
+      entry['id'] = idToUse;
 
-      list.add(entry);
+      if (_loadedDraftId != null) {
+        // Try to find an existing draft with this id and replace it.
+        final idx = list.indexWhere(
+          (m) =>
+              ((m as Map<String, dynamic>)['id'] as String?) == _loadedDraftId,
+        );
+        if (idx >= 0) {
+          final existing = Map<String, dynamic>.from(list[idx] as Map);
+          entry['createdAt'] =
+              existing['createdAt'] ?? DateTime.now().toIso8601String();
+          list[idx] = entry;
+        } else {
+          entry['createdAt'] = DateTime.now().toIso8601String();
+          list.add(entry);
+        }
+      } else {
+        entry['createdAt'] = DateTime.now().toIso8601String();
+        list.add(entry);
+      }
+
       await prefs.setString('quote_drafts', jsonEncode(list));
 
       // Also update the single-key for backward compatibility
-      await prefs.setString('quote_draft', jsonEncode(data));
+      // Ensure the single draft contains an id/createdAt when possible.
+      final single = Map<String, dynamic>.from(data);
+      single['id'] = entry['id'];
+      single['createdAt'] = entry['createdAt'];
+      await prefs.setString('quote_draft', jsonEncode(single));
 
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -463,8 +565,14 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
           ),
         ),
       );
+
+      // Clear the form so user can enter next quote
+      _clearForm();
     } catch (err) {
       // Fallback: try writing to single key
+      for (var item in _lineItems) {
+        item.total = _computeLineTotal(item);
+      }
       await prefs.setString('quote_draft', jsonEncode(data));
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -477,6 +585,9 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
           ),
         ),
       );
+
+      // Clear the form after fallback save as well
+      _clearForm();
     }
   }
 
@@ -611,6 +722,26 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
     _calculateQuote();
     // In a real app, you'd save and maybe trigger an email
     _showMockSnackBar('Quote marked as "Sent" and saved!', Icons.send_rounded);
+    // If this quote was loaded from a draft, remove that draft now
+    if (_loadedDraftId != null) {
+      _deleteDraftById(_loadedDraftId!);
+      _loadedDraftId = null;
+    }
+  }
+
+  /// Delete a draft from SharedPreferences by its `id` field.
+  Future<void> _deleteDraftById(String id) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString('quote_drafts');
+      if (raw == null) return;
+      final list = (jsonDecode(raw) as List<dynamic>)
+          .cast<Map<String, dynamic>>();
+      list.removeWhere((m) => (m['id'] as String?) == id);
+      await prefs.setString('quote_drafts', jsonEncode(list));
+    } catch (_) {
+      // ignore failures silently; not critical
+    }
   }
 
   void _printQuote() {
@@ -620,7 +751,22 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
   /// Whether the Send / Print actions should be enabled.
   /// We reuse the existing validation helpers: require there to be draft-worthy
   /// data and to not be considered "incomplete".
-  bool get _canSendOrPrint => _hasDraftData() && !_isDraftIncomplete();
+  bool get _canSendOrPrint {
+    // Require full client details (name and address) and at least one
+    // line item that has a name and a non-zero computed total.
+    final clientNameOk = _clientNameController.text.trim().isNotEmpty;
+    final clientAddressOk = _clientAddressController.text.trim().isNotEmpty;
+
+    final hasValidItem =
+        _lineItems.isNotEmpty &&
+        _lineItems.any((item) {
+          final nameOk = item.name.trim().isNotEmpty;
+          final total = _computeLineTotal(item);
+          return nameOk && total > 0;
+        });
+
+    return clientNameOk && clientAddressOk && hasValidItem;
+  }
 
   Future<void> _generateAndPrintPdf() async {
     // Build a simple PDF document reflecting the current quote state.
@@ -882,7 +1028,18 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
                       : (d['clientRef'] as String?)?.trim().isNotEmpty == true
                       ? d['clientRef']
                       : 'Untitled Draft';
-                  final created = (d['createdAt'] as String?) ?? d['id'] ?? '';
+                  // Format createdAt for display as dd/MM/yyyy HH:mm when possible.
+                  final rawCreated =
+                      (d['createdAt'] as String?) ?? d['id'] ?? '';
+                  String created;
+                  try {
+                    final dt = DateTime.parse(rawCreated);
+                    created = DateFormat(
+                      'dd/MM/yyyy HH:mm',
+                    ).format(dt.toLocal());
+                  } catch (_) {
+                    created = rawCreated;
+                  }
                   return ListTile(
                     title: Text(title),
                     subtitle: Text(created),
@@ -890,12 +1047,16 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
                     trailing: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        IconButton(
-                          icon: const Icon(Icons.download_rounded),
-                          tooltip: 'Load',
+                        TextButton.icon(
+                          icon: const Icon(Icons.edit, size: 18),
+                          label: const Text('Edit'),
                           onPressed: () {
                             Navigator.of(ctx).pop();
                             try {
+                              // Record which draft was loaded so we can remove it
+                              // if the user sends the quote.
+                              _loadedDraftId =
+                                  (d['id'] as String?) ?? _loadedDraftId;
                               _applyDraftMap(Map<String, dynamic>.from(d));
                               _showMockSnackBar('Draft loaded', Icons.refresh);
                             } catch (_) {
@@ -906,9 +1067,10 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
                             }
                           },
                         ),
-                        IconButton(
-                          icon: const Icon(Icons.delete_outline),
-                          tooltip: 'Delete',
+                        const SizedBox(width: 8),
+                        TextButton.icon(
+                          icon: const Icon(Icons.delete_outline, size: 18),
+                          label: const Text('Delete'),
                           onPressed: () => deleteAt(i),
                         ),
                       ],
@@ -1076,6 +1238,14 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
               key: _currencyFieldKey,
               onTap: () async {
                 if (!_isEditable) return;
+                // Toggle: if overlay already present, remove it (second tap closes)
+                if (_currencyOverlayEntry != null) {
+                  try {
+                    _currencyOverlayEntry!.remove();
+                  } catch (_) {}
+                  _currencyOverlayEntry = null;
+                  return;
+                }
                 final RenderBox? rb =
                     _currencyFieldKey.currentContext?.findRenderObject()
                         as RenderBox?;
@@ -1167,6 +1337,7 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
                                           ),
                                           onTap: () {
                                             overlayEntry.remove();
+                                            _currencyOverlayEntry = null;
                                             if (symbol !=
                                                 _selectedCurrencySymbol) {
                                               setState(() {
@@ -1198,6 +1369,7 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
                 );
 
                 Overlay.of(context, rootOverlay: true).insert(overlayEntry);
+                _currencyOverlayEntry = overlayEntry;
               },
               child: InputDecorator(
                 decoration: InputDecoration(
@@ -1243,9 +1415,30 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(
-              'Client Information',
-              style: Theme.of(context).textTheme.titleLarge,
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    'Client Information',
+                    style: Theme.of(context).textTheme.titleLarge,
+                  ),
+                ),
+                // Show a compact "New Client" action when the form is not
+                // editable (e.g., after sending). Clicking it clears the
+                // form and returns the UI to the draft/editable state.
+                if (!_isEditable)
+                  TextButton.icon(
+                    icon: const Icon(Icons.person_add, size: 18),
+                    label: const Text('New Client'),
+                    onPressed: () {
+                      _clearForm();
+                      _showMockSnackBar(
+                        'Ready for next client',
+                        Icons.person_add,
+                      );
+                    },
+                  ),
+              ],
             ),
             const SizedBox(height: 20),
             ResponsiveFieldGrid(
@@ -1334,6 +1527,7 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
     // This is a complex widget. We use a combination of LayoutBuilder
     // and manual layout to make it responsive.
     return Padding(
+      key: ValueKey(item.id),
       padding: const EdgeInsets.symmetric(vertical: 8.0),
       child: Column(
         children: [
@@ -1365,6 +1559,9 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
                   label: 'Qty',
                   initialValue: item.quantity.toString(),
                   keyboardType: TextInputType.number,
+                  inputFormatters: [
+                    FilteringTextInputFormatter.allow(RegExp(r'[0-9.]')),
+                  ],
                   onChanged: (val) {
                     item.quantity = double.tryParse(val) ?? 0;
                     _calculateQuote();
@@ -1380,6 +1577,9 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
                   initialValue: item.rate != 0 ? item.rate.toString() : null,
                   hint: '0',
                   keyboardType: TextInputType.number,
+                  inputFormatters: [
+                    FilteringTextInputFormatter.allow(RegExp(r'[0-9.]')),
+                  ],
                   onChanged: (val) {
                     item.rate = double.tryParse(val) ?? 0;
                     _calculateQuote();
@@ -1397,6 +1597,9 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
                       : null,
                   hint: '0',
                   keyboardType: TextInputType.number,
+                  inputFormatters: [
+                    FilteringTextInputFormatter.allow(RegExp(r'[0-9.]')),
+                  ],
                   onChanged: (val) {
                     item.discount = double.tryParse(val) ?? 0;
                     _calculateQuote();
@@ -1414,6 +1617,9 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
                       : null,
                   hint: '0',
                   keyboardType: TextInputType.number,
+                  inputFormatters: [
+                    FilteringTextInputFormatter.allow(RegExp(r'[0-9.]')),
+                  ],
                   onChanged: (val) {
                     item.taxPercent = double.tryParse(val) ?? 0;
                     _calculateQuote();
@@ -1435,7 +1641,7 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
                 ).textTheme.bodyMedium?.copyWith(color: Colors.grey[600]),
               ),
               Text(
-                _currencyFormatter.format(item.total),
+                _currencyFormatter.format(_computeLineTotal(item)),
                 style: Theme.of(
                   context,
                 ).textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold),
@@ -1504,22 +1710,8 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
         padding: const EdgeInsets.symmetric(vertical: 8.0),
         child: ResponsiveFieldGrid(
           children: [
-            ElevatedButton.icon(
-              icon: const Icon(Icons.save_alt_rounded),
-              label: const Text('Save Draft'),
-              onPressed: _saveQuote,
-              style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.grey[700],
-              ),
-            ),
-            ElevatedButton.icon(
-              icon: const Icon(Icons.folder_open),
-              label: const Text('Load Draft'),
-              onPressed: _openDraftManager,
-              style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.indigo[600],
-              ),
-            ),
+            SaveDraftButton(onPressed: _saveQuote, enabled: true),
+            LoadDraftButton(onPressed: _openDraftManager, enabled: true),
             ElevatedButton.icon(
               icon: const Icon(Icons.send_rounded),
               label: const Text('Simulate Send'),
@@ -1605,9 +1797,10 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
                   ],
                 ),
                 MouseRegion(
-                  cursor: _quoteStatus == QuoteStatus.sent
-                      ? SystemMouseCursors.click
-                      : SystemMouseCursors.basic,
+                  // Always show the pointing-hand cursor when hovering the
+                  // status chip so users see it's interactive (small change
+                  // only; existing tap behavior remains unchanged).
+                  cursor: SystemMouseCursors.click,
                   child: Material(
                     color: Colors.transparent,
                     child: InkWell(
@@ -1769,7 +1962,7 @@ class _QuoteBuilderPageState extends State<QuoteBuilderPage> {
           ),
           const SizedBox(width: 16),
           Text(
-            _currencyFormatter.format(item.total),
+            _currencyFormatter.format(_computeLineTotal(item)),
             style: Theme.of(
               context,
             ).textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.w500),

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 /// A helper for creating a labeled TextFormField
 Widget buildTextField({
@@ -9,6 +10,7 @@ Widget buildTextField({
   int maxLines = 1,
   TextInputType? keyboardType,
   Function(String)? onChanged,
+  List<TextInputFormatter>? inputFormatters,
   Widget? prefixIcon,
   bool enabled = true,
 }) {
@@ -52,6 +54,7 @@ Widget buildTextField({
         ),
         maxLines: maxLines,
         keyboardType: keyboardType,
+        inputFormatters: inputFormatters,
         onChanged: onChanged,
       ),
     ],
